@@ -1,0 +1,24 @@
+version: "3.9"
+
+services:
+  greeter:
+    image: jldeen/greeter:latest
+    container_name: greeter
+    environment:
+      PORT: 80
+      GREETING_URL: http://greeting:3000
+      NAME_URL: http://name:3000
+    ports:
+      - 3000:80
+  greeting:
+    image: jldeen/greeting:latest
+    container_name: greeting
+    ports:
+      - 3001:3000
+  name:
+    image: jldeen/name:latest
+    container_name: name
+    environment:
+      name: Jessica
+    ports:
+      - 3002:3000

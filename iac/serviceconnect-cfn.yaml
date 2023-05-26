@@ -1,0 +1,766 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >
+  This template provisions the infrastructure and deploys the Fargate services for use with the greeter sample application and Service Connect migration blog post.
+
+Parameters:
+  StackName:
+    Type: String
+    Default: greeter
+    Description: The name of the parent Fargate networking stack you created. Necessary to locate and reference resources created by said stack.
+
+  EnvironmentName:
+    Type: String
+    Default: "ecs"
+    Description: An environment name that will be prefixed to resource names
+
+  GreeterServiceConnectNS:
+    Type: String
+    Default: "internal"
+    Description: Service connect namespace.
+
+  ClusterName:
+    Type: String
+    Default: "greeter-cluster"
+    Description: ECS Cluster name
+
+Mappings:
+  # Hard values for the subnet masks. These masks define
+  # the range of internal IP addresses that can be assigned.
+  # The VPC can have all IP's from 10.0.0.0 to 10.0.255.255
+  # There are four subnets which cover the ranges:
+  #
+  # 10.0.0.0 - 10.0.31.255
+  # 10.0.32.0 - 10.0.63.255
+  # 10.0.64.0 - 10.0.95.255
+  # 10.0.96.0 - 10.0.127.255
+  #
+  # If you need more IP addresses (perhaps you have so many
+  # instances that you run out) then you can customize these
+  # ranges to add more
+  SubnetConfig:
+    VPC:
+      CIDR: "10.0.0.0/16"
+    Public1:
+      CIDR: "10.0.0.0/19"
+    Public2:
+      CIDR: "10.0.32.0/19"
+    Private1:
+      CIDR: "10.0.64.0/19"
+    Private2:
+      CIDR: "10.0.96.0/19"
+Resources:
+  # VPC in which containers will be networked.
+  # It has two public subnets, and two private subnets.
+  # We distribute the subnets across the first two available subnets
+  # for the region, for high availability.
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap ["SubnetConfig", "VPC", "CIDR"]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Ref EnvironmentName
+
+  # Two public subnets, where containers can have public IP addresses
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "Public1", "CIDR"]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 1
+
+  PublicSubnet1RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 1 Route Table
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicSubnet1RouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet1DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PublicSubnet1RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VPCInternetGateway
+    DependsOn:
+      - VPC
+
+  PublicSubnet1EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PublicSubnet1NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt PublicSubnet1EIP.AllocationId
+      SubnetId:
+        Ref: PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 1 Nat Gateway
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "Public2", "CIDR"]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 2
+
+  PublicSubnet2RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId:
+        Ref: "VPC"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 2 Route Table
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicSubnet2RouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PublicSubnet2DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId:
+        Ref: PublicSubnet2RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VPCInternetGateway
+    DependsOn:
+      - VPC
+
+  PublicSubnet2EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PublicSubnet2NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt PublicSubnet2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Public Subnet 2 Nat Gateway
+
+  # Two private subnets where containers will only have private
+  # IP addresses, and will only be reachable by other members of the VPC
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "Private1", "CIDR"]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ1)
+
+  PrivateSubnet1RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref "VPC"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet 1 Route Table
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateSubnet1RouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet1DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateSubnet1RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref PublicSubnet1NatGateway
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: { Ref: "AWS::Region" }
+      VpcId: !Ref "VPC"
+      CidrBlock: !FindInMap ["SubnetConfig", "Private2", "CIDR"]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet (AZ2)
+
+  PrivateSubnet2RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref "VPC"
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} Private Subnet 2 Route Table
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateSubnet2RouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  PrivateSubnet2DefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateSubnet2RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref PublicSubnet2NatGateway
+
+  # VPC Internet Gateway and Gateway Attachment
+  VPCInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} VPC Internet Gateway
+
+  VPCInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref "VPC"
+      InternetGatewayId: !Ref VPCInternetGateway
+
+  # ECS Resources
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      ServiceConnectDefaults:
+        Namespace: !GetAtt GreeterServiceConnectDNSNamespace.Arn
+
+# Public ALB
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: public-http-lb
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref PublicHTTPSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Type: application
+
+  PublicLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      #  Check if your application is healthy within 20 = 10*2 seconds, compared to 2.5 mins = 30*5 seconds.
+      HealthCheckIntervalSeconds: 10 # Default is 30.
+      HealthyThresholdCount: 2       # Default is 5.
+      HealthCheckTimeoutSeconds: 5
+      Name: public-tg
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 0
+      Port: 80
+      TargetType: ip
+      IpAddressType: ipv4
+
+  PublicLBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref PublicLBTargetGroup
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  PublicHTTPSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: HTTP access to the public facing load balancer
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          Description: Allow all outbound traffic by default
+          IpProtocol: "-1"
+      SecurityGroupIngress:
+        # Allow access to public facing ALB from any IP address
+        - CidrIp: 0.0.0.0/0
+          Description: Allow from anyone on port 80
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+      VpcId: !Ref VPC
+
+  GreeterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VPC
+      GroupDescription: Default Greeter Security Group
+
+  HTTPSecurityGroupIngressFromPublic:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: HTTP ingress from the public ALB
+      GroupId: !Ref GreeterSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'PublicHTTPSecurityGroup'
+
+# Internal Load Balancer for Backend Services
+  InternalLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: internal
+      Scheme: internal
+      SecurityGroups:
+        - !Ref "InternalSecurityGroup"
+      Subnets:
+        - !Ref "PrivateSubnet1"
+        - !Ref "PrivateSubnet2"
+      Type: application
+
+# Internal ELB and Target Groups
+  InternalSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal load balancer security group
+      GroupName: internal-lb-sg
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: tcp
+          ToPort: 3000
+          FromPort: 3000
+      VpcId: !Ref VPC
+
+  InternalLBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: text/html
+            MessageBody: "Undergoing Maintenance Currently."
+            StatusCode: 200
+      LoadBalancerArn: !Ref "InternalLoadBalancer"
+      Port: 80
+      Protocol: HTTP
+
+  InternalLoadBalancerIngressFromGreeter:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from greeter
+      GroupId: !Ref InternalSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'GreeterSecurityGroup'
+
+  GreeterServiceIngressfromExternalLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: !Ref GreeterSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'PublicHTTPSecurityGroup'
+
+  # BackendServiceIngressfromInternalLoadBalancer:
+  #   Type: AWS::EC2::SecurityGroupIngress
+  #   Properties:
+  #     Description: Ingress from the internal ALB
+  #     GroupId: !Ref BackendSecurityGroup
+  #     IpProtocol: -1
+  #     SourceSecurityGroupId: !Ref 'InternalSecurityGroup'
+
+  BackendServiceIngressfromGreeter:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the internal ALB
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'GreeterSecurityGroup'
+
+  BackendServiceIngressfromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from self (not technically used, but useful for debugging)
+      GroupId: !Ref BackendSecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref 'BackendSecurityGroup'
+
+  InternalBackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: internal-backend-tg
+      VpcId: !Ref "VPC"
+      Protocol: HTTP
+      Port: 80
+      TargetType: ip
+      IpAddressType: ipv4
+      HealthCheckPath: /
+
+  # Service Security groups
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: backend service security group
+      VpcId: !Ref VPC
+
+# ELB Listener Rules for Target Group Routing
+  GreetingTrafficRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+     ListenerArn: !Ref InternalLBListener
+     Priority: 1
+     Actions:
+       - Type: forward
+         TargetGroupArn: !Ref InternalBackendTargetGroup
+     Conditions:
+       - Field: path-pattern
+         Values:
+          - /greeting*
+
+  NameTrafficRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+     ListenerArn: !Ref InternalLBListener
+     Priority: 2
+     Actions:
+       - Type: forward
+         TargetGroupArn: !Ref InternalBackendTargetGroup
+     Conditions:
+       - Field: path-pattern
+         Values:
+          - /name*
+
+  # IAM Rule
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'ExecuteCommand'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: ["ssmmessages:CreateControlChannel", "ssmmessages:OpenControlChannel", "ssmmessages:CreateDataChannel", "ssmmessages:OpenDataChannel"]
+                Resource: "*"
+              - Effect: 'Allow'
+                Action: ["logs:CreateLogStream", "logs:DescribeLogGroups", "logs:DescribeLogStreams", "logs:PutLogEvents"]
+                Resource: "*"
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+
+      # This role enables all features of ECS. See reference:
+      # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/security-iam-awsmanpol.html#security-iam-awsmanpol-AmazonECSTaskExecutionRolePolicy
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  GreeterServiceConnectDNSNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    DependsOn: BackendServiceIngressfromGreeter
+    Properties:
+      Description: "Service Connect HTTP Namespace for Greeter Application"
+      Name: !Ref "GreeterServiceConnectNS"
+      Vpc: !Ref VPC
+
+  # greeter Service and Task Definition
+  GreeterService:
+    Type: AWS::ECS::Service
+    DependsOn: [GreeterServiceConnectDNSNamespace, GreetingService, NameService]
+    # DependsOn: [PublicLBListener, GreetingService, NameService]
+    Properties:
+      ServiceName: "greeter-service"
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref "PublicSubnet1", !Ref "PublicSubnet2"]
+          SecurityGroups: [!Ref "GreeterSecurityGroup"]
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      DesiredCount: 2
+      TaskDefinition: !Ref "GreeterTaskDef"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Ref GreeterServiceConnectNS
+        Services:
+          - PortName: greeter
+            DiscoveryName: greeter
+            ClientAliases:
+              - DnsName: greeter
+                Port: 80
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: ecs/greeter
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: "greeter-envoy"
+      LoadBalancers:
+        - ContainerName: "greeter"
+          ContainerPort: 80
+          TargetGroupArn: !Ref PublicLBTargetGroup
+
+  GreeterTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: greeter
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref "ECSTaskExecutionRole"
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: greeter
+          Image: jldeen/greeter:latest
+          Cpu: 100
+          Essential: true
+          PortMappings:
+            - Name: greeter
+              AppProtocol: http
+              ContainerPort: 80
+          Environment:
+            - Name: PORT
+              Value: 80
+            - Name: GREETING_URL
+              Value: !Sub "http://greeting:3000"
+            - Name: NAME_URL
+              Value: !Sub "http://name:3000"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: ecs/greeter
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "greeter"
+
+  # greeter Service and Task Definition
+  GreetingService:
+    Type: AWS::ECS::Service
+    DependsOn: GreeterServiceConnectDNSNamespace
+    # DependsOn: GreetingTrafficRule
+    Properties:
+      ServiceName: "greeting-service"
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref "PrivateSubnet1", !Ref "PrivateSubnet2"]
+          SecurityGroups: [!Ref "BackendSecurityGroup"]
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      DesiredCount: 2
+      TaskDefinition: !Ref "GreetingTaskDef"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Ref GreeterServiceConnectNS
+        Services:
+          - PortName: greeting
+            DiscoveryName: greeting
+            ClientAliases:
+              - DnsName: greeting
+                Port: 3000
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: ecs/greeter
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: "greeting-envoy"
+      LoadBalancers: !Ref AWS::NoValue
+
+  GreetingTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: greeting
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref "ECSTaskExecutionRole"
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: greeting
+          Image: jldeen/greeting:latest
+          Cpu: 100
+          Essential: true
+          PortMappings:
+            - Name: greeting
+              AppProtocol: http
+              ContainerPort: 3000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: ecs/greeter
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "greeter"
+
+  # name Service and Task Definition
+  NameService:
+    Type: AWS::ECS::Service
+    DependsOn: GreeterServiceConnectDNSNamespace
+    # DependsOn: NameTrafficRule
+    Properties:
+      ServiceName: "name-service"
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: [!Ref "PrivateSubnet1", !Ref "PrivateSubnet2"]
+          SecurityGroups: [!Ref "BackendSecurityGroup"]
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+      DesiredCount: 2
+      TaskDefinition: !Ref "NameTaskDef"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Ref GreeterServiceConnectNS
+        Services:
+          - PortName: name
+            DiscoveryName: name
+            ClientAliases:
+              - DnsName: name
+                Port: 3000
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: ecs/greeter
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: "name-envoy"
+      LoadBalancers: !Ref AWS::NoValue
+
+  NameTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: name
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref "ECSTaskExecutionRole"
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: name
+          Image: jldeen/name:latest
+          Cpu: 100
+          Essential: true
+          PortMappings:
+            - Name: name
+              AppProtocol: http
+              ContainerPort: 3000
+          Environment:
+            - Name: name
+              Value: 'Jessica'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: ecs/greeter
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "greeter"
+  # Cloudwatch Logs
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "ecs/greeter"
+      RetentionInDays: 90
+
+Outputs:
+  VPC:
+    Description: A reference to the created VPC
+    Value: !Ref VPC
+    Export:
+      Name: vpcId
+
+  AccountId:
+    Description: Outputs the Account ID the stack resources are deployed to
+    Value: !Sub "${AWS::AccountId}"
+    Export:
+      Name: awsAccountId
+
+  StackName:
+    Description: Outputs the stack name
+    Value: !Sub "${AWS::StackName}"
+    Export:
+      Name: awsStackName
+
+  ClusterName:
+    Description: Outputs the ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: clusterName
+
+  PrivateSubnet1:
+    Description: Outputs Private Subnet ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: privateSubnet1
+
+  Region:
+    Description: Outputs the region the stack resources are deployed to
+    Value: !Sub "${AWS::Region}"
+    Export:
+      Name: awsRegion
+
+  PublicLoadBalancerDns:
+    Description: External Load Balancer Fully Qualified Domain Name
+    Value: !Join
+      - ""
+      - - "http://"
+        - !GetAtt PublicLoadBalancer.DNSName
+        - "/"
+    Export:
+      Name: greeterfqdn
